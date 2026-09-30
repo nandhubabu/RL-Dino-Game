@@ -159,13 +159,15 @@ class DinoEnv:
 
         # --- 3. Move Obstacles & Check Collisions ---
         dino_rect = pygame.Rect(DINO_X, int(self.dino_y), DINO_WIDTH, DINO_HEIGHT)
+        dino_hitbox = dino_rect.inflate(-6, -4)  # Fair hitbox inset (Chrome Dino style)
 
         for obs in self.obstacles:
             obs['x'] -= self.game_speed
             obs_rect = pygame.Rect(int(obs['x']), int(obs['y']), obs['w'], obs['h'])
+            obs_hitbox = obs_rect.inflate(-4, -2)
 
             # Collision detection
-            if obs_rect.colliderect(dino_rect):
+            if obs_hitbox.colliderect(dino_hitbox):
                 self.game_over = True
 
             # Obstacle-cleared bonus (dino's right edge passes obstacle's right edge)
@@ -281,10 +283,12 @@ class DinoEnv:
         vel_norm = self.dino_vel_y / abs(JUMP_VELOCITY) if JUMP_VELOCITY != 0 else 0.0
 
         # Find nearest obstacle ahead of the dino
+        dino_front = DINO_X + DINO_WIDTH
         ahead = [o for o in self.obstacles if o['x'] + o['w'] > DINO_X]
         if ahead:
             nearest = min(ahead, key=lambda o: o['x'])
-            dist_norm = (nearest['x'] - DINO_X) / SCREEN_WIDTH
+            dist_px = nearest['x'] - dino_front
+            dist_norm = dist_px / SCREEN_WIDTH
             width_norm = nearest['w'] / OBSTACLE_MAX_WIDTH
             height_norm = nearest['h'] / OBSTACLE_MAX_HEIGHT
         else:

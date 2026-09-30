@@ -44,6 +44,7 @@ class DQNAgent:
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.obs_mode = obs_mode
+        self.architecture = architecture
         self.double_dqn = double_dqn
         self.soft_update = soft_update
         self.tau = tau
@@ -180,6 +181,8 @@ class DQNAgent:
             'episode': episode,
             'steps_done': self.steps_done,
             'best_score': best_score,
+            'obs_mode': self.obs_mode,
+            'architecture': self.architecture,
             'policy_net_state_dict': self.policy_net.state_dict(),
             'target_net_state_dict': self.target_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),

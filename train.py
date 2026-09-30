@@ -82,10 +82,11 @@ def train(args):
 
     # Resume from checkpoint
     start_episode = 0
-    best_score = float('-inf')
+    best_reward = float('-inf')
+    best_game_score = 0
     if args.resume:
-        start_episode, best_score = agent.load_checkpoint(args.resume)
-        print(f'  Resumed from episode {start_episode}, best score: {best_score:.1f}')
+        start_episode, best_reward = agent.load_checkpoint(args.resume)
+        print(f'  Resumed from episode {start_episode}, best reward: {best_reward:.1f}')
 
     # ---- Training Loop ------------------------------------------------
     recent_scores = []
@@ -160,34 +161,37 @@ def train(args):
             if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
                 path = os.path.join(args.checkpoint_dir,
                                     f'checkpoint_ep{episode}.pth')
-                agent.save_checkpoint(path, episode, best_score)
+                agent.save_checkpoint(path, episode, best_reward)
                 print(f'  Saved checkpoint: {path}')
 
-            # Best model
-            if episode_reward > best_score:
-                best_score = episode_reward
+            # Best model (prioritizes obstacles cleared, then reward)
+            is_new_best = (info['score'] > best_game_score) or \
+                          (info['score'] == best_game_score and episode_reward > best_reward)
+            if is_new_best:
+                best_game_score = info['score']
+                best_reward = episode_reward
                 path = os.path.join(args.checkpoint_dir, 'best_model.pth')
-                agent.save_checkpoint(path, episode, best_score)
-                print(f'  New best! Saved: {path}')
+                agent.save_checkpoint(path, episode, best_reward)
+                print(f'  New best! Score: {best_game_score:2d}, Reward: {best_reward:6.1f} -> {path}')
 
             # Latest (always, for easy resume)
             agent.save_checkpoint(
                 os.path.join(args.checkpoint_dir, 'latest.pth'),
-                episode, best_score)
+                episode, best_reward)
 
     except KeyboardInterrupt:
         print(f'\n{"=" * 60}')
         print(f'  Training interrupted at episode {episode}')
         path = os.path.join(args.checkpoint_dir,
                             f'interrupted_ep{episode}.pth')
-        agent.save_checkpoint(path, episode, best_score)
+        agent.save_checkpoint(path, episode, best_reward)
         print(f'  Saved: {path}')
         print('=' * 60)
 
     finally:
         writer.close()
         env.close()
-        print(f'\n  Best score achieved: {best_score:.1f}')
+        print(f'\n  Best score achieved: {best_game_score} (Reward: {best_reward:.1f})')
         print(f'  TensorBoard logs  : {args.log_dir}/{run_name}')
         print(f'  To view: tensorboard --logdir {args.log_dir}')
 

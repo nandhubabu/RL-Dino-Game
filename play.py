@@ -31,10 +31,10 @@ def parse_args():
     p = argparse.ArgumentParser(description='Watch the trained AI play Dino Run')
     p.add_argument('--checkpoint', type=str, default=None,
                    help='Path to model checkpoint (auto-detects if omitted)')
-    p.add_argument('--obs', choices=['pixels', 'features'], default='pixels',
-                   help='Observation mode (must match training)')
-    p.add_argument('--arch', choices=['dqn', 'dueling'], default='dueling',
-                   help='Architecture (must match training)')
+    p.add_argument('--obs', choices=['pixels', 'features'], default=None,
+                   help='Observation mode (auto-detects from checkpoint if omitted)')
+    p.add_argument('--arch', choices=['dqn', 'dueling'], default=None,
+                   help='Architecture (auto-detects from checkpoint if omitted)')
     p.add_argument('--fps', type=int, default=30,
                    help='Playback FPS (default: 30)')
     p.add_argument('--games', type=int, default=0,
@@ -136,18 +136,40 @@ def play(args):
         print('  Or specify manually : python play.py --checkpoint <path>')
         sys.exit(1)
 
+    # Auto-detect obs_mode and arch from checkpoint if not specified
+    obs_mode = args.obs
+    arch = args.arch
+    try:
+        import torch
+        data = torch.load(ckpt, map_location='cpu')
+        if isinstance(data, dict):
+            if obs_mode is None and 'obs_mode' in data:
+                obs_mode = data['obs_mode']
+            if arch is None and 'architecture' in data:
+                arch = data['architecture']
+            state_dict = data.get('policy_net_state_dict', data)
+            if obs_mode is None:
+                if any('network' in k for k in state_dict.keys()) or not any('conv' in k for k in state_dict.keys()):
+                    obs_mode = 'features'
+                else:
+                    obs_mode = 'pixels'
+    except Exception:
+        pass
+    obs_mode = obs_mode or 'pixels'
+    arch = arch or 'dueling'
+
     print('=' * 60)
     print('  Dino RL - AI Playback')
     print(f'  Checkpoint  : {ckpt}')
-    print(f'  Architecture: {args.arch}')
-    print(f'  Obs Mode    : {args.obs}')
+    print(f'  Architecture: {arch}')
+    print(f'  Obs Mode    : {obs_mode}')
     print(f'  FPS         : {args.fps}')
     print('  Press ESC or close the window to quit')
     print('=' * 60)
 
     # ---- Setup ----
-    env = DinoEnv(headless=False, obs_mode=args.obs, render_fps=args.fps)
-    agent = DQNAgent(obs_mode=args.obs, architecture=args.arch)
+    env = DinoEnv(headless=False, obs_mode=obs_mode, render_fps=args.fps)
+    agent = DQNAgent(obs_mode=obs_mode, architecture=arch)
     agent.load_model_only(ckpt)
 
     high_score = 0
