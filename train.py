@@ -1,164 +1,196 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+"""
+Training script for the Dino RL agent.
+
+Usage:
+    python train.py                                        # Default: Dueling DDQN, pixel mode
+    python train.py --obs features                         # Fast MLP training (~2 min)
+    python train.py --episodes 2000                        # Train for 2000 episodes
+    python train.py --resume checkpoints/latest.pth        # Resume interrupted run
+    python train.py --no-render                            # Headless (fastest)
+    python train.py --arch dqn --no-double                 # Vanilla DQN baseline
+
+After training, view metrics:
+    tensorboard --logdir runs
+"""
+import argparse
+import os
+import time
 import numpy as np
-import random
-from collections import deque
-import cv2
-from dino_game import DinoGame  # Imports your game file
+from datetime import datetime
 
-# --- 1. HYPERPARAMETERS ---
-BATCH_SIZE = 32
-GAMMA = 0.99           # Discount factor (cares about future)
-EPS_START = 1.0        # 100% random at start
-EPS_END = 0.01         # 1% random at end
-EPS_DECAY = 10000      # How fast to stop being random
-TARGET_UPDATE = 1000   # Update "Teacher" network every 1k steps
-LR = 0.00025           # Learning Rate
-MEMORY_SIZE = 50000
+import torch
+from torch.utils.tensorboard import SummaryWriter
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from config import (
+    NUM_EPISODES, CHECKPOINT_INTERVAL, CHECKPOINT_DIR, LOG_DIR,
+)
+from env.dino_env import DinoEnv
+from agents.dqn_agent import DQNAgent
 
-# --- 2. THE BRAIN (Neural Network) ---
-class DQN(nn.Module):
-    def __init__(self, h, w, outputs):
-        super(DQN, self).__init__()
-        # 1. Visual Layers (CNN)
-        # Input: 4 stacked frames (grayscale)
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
-        # Calculate the size of the output from conv layers to feed into linear
-        def conv2d_size_out(size, kernel_size=3, stride=1):
-            return (size - (kernel_size - 1) - 1) // stride + 1
-        
-        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
-        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
-        linear_input_size = convw * convh * 64
+def parse_args():
+    p = argparse.ArgumentParser(description='Train a DQN agent to play Dino Run')
+    p.add_argument('--episodes', type=int, default=NUM_EPISODES,
+                   help=f'Number of training episodes (default: {NUM_EPISODES})')
+    p.add_argument('--obs', choices=['pixels', 'features'], default='pixels',
+                   help='Observation mode: pixels (CNN) or features (MLP)')
+    p.add_argument('--arch', choices=['dqn', 'dueling'], default='dueling',
+                   help='Network architecture (default: dueling)')
+    p.add_argument('--no-double', action='store_true',
+                   help='Disable Double DQN (use standard DQN targets)')
+    p.add_argument('--no-render', action='store_true',
+                   help='Headless mode — no window, fastest training')
+    p.add_argument('--resume', type=str, default=None,
+                   help='Path to checkpoint file to resume training')
+    p.add_argument('--checkpoint-dir', type=str, default=CHECKPOINT_DIR,
+                   help=f'Checkpoint directory (default: {CHECKPOINT_DIR})')
+    p.add_argument('--log-dir', type=str, default=LOG_DIR,
+                   help=f'TensorBoard log directory (default: {LOG_DIR})')
+    return p.parse_args()
 
-        # 2. Decision Layers (Fully Connected)
-        self.fc1 = nn.Linear(linear_input_size, 512)
-        self.head = nn.Linear(512, outputs) # Outputs: [Jump_Score, Do_Nothing_Score]
 
-    def forward(self, x):
-        x = x.to(device)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))
-        x = x.view(x.size(0), -1) # Flatten
-        x = torch.relu(self.fc1(x))
-        return self.head(x)
+def train(args):
+    # ---- Setup --------------------------------------------------------
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-# --- 3. HELPER: PROCESS IMAGE ---
-def process_screen(screen):
-    # Convert to grayscale
-    screen = cv2.cvtColor(screen, cv2.COLOR_RGB2GRAY)
-    # Resize to 84x84
-    screen = cv2.resize(screen, (84, 84))
-    # Normalize (0-1) and add dimension for PyTorch
-    screen = np.ascontiguousarray(screen, dtype=np.float32) / 255.0
-    screen = torch.from_numpy(screen)
-    return screen.unsqueeze(0) # Shape: (1, 84, 84)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f'{args.arch}_{args.obs}_{timestamp}'
+    writer = SummaryWriter(os.path.join(args.log_dir, run_name))
 
-# --- 4. MAIN TRAINING LOOP ---
-game = DinoGame()
-n_actions = 2 # Jump (1) or Nothing (0)
+    env = DinoEnv(
+        headless=args.no_render,
+        obs_mode=args.obs,
+        render_fps=0 if args.no_render else 30,
+    )
 
-# Initialize Networks
-policy_net = DQN(84, 84, n_actions).to(device)
-target_net = DQN(84, 84, n_actions).to(device)
-target_net.load_state_dict(policy_net.state_dict()) # Clone student to teacher
-target_net.eval()
+    agent = DQNAgent(
+        obs_mode=args.obs,
+        architecture=args.arch,
+        double_dqn=not args.no_double,
+    )
 
-optimizer = optim.Adam(policy_net.parameters(), lr=LR)
-memory = deque(maxlen=MEMORY_SIZE)
+    algo = f"{'Double ' if not args.no_double else ''}{'Dueling ' if args.arch == 'dueling' else ''}DQN"
+    print('=' * 60)
+    print('  Dino RL Training')
+    print(f'  Algorithm  : {algo}')
+    print(f'  Obs Mode   : {args.obs}')
+    print(f'  Device     : {agent.device}')
+    print(f'  Episodes   : {args.episodes}')
+    print(f'  Headless   : {args.no_render}')
+    print(f'  TensorBoard: tensorboard --logdir {args.log_dir}')
+    print('=' * 60)
 
-steps_done = 0
+    # Resume from checkpoint
+    start_episode = 0
+    best_score = float('-inf')
+    if args.resume:
+        start_episode, best_score = agent.load_checkpoint(args.resume)
+        print(f'  Resumed from episode {start_episode}, best score: {best_score:.1f}')
 
-print(f"Training on {device}... Press Ctrl+C to stop.")
+    # ---- Training Loop ------------------------------------------------
+    recent_scores = []
+    total_steps = 0
 
-for i_episode in range(1000): # Play 1000 games
-    # Reset Environment
-    raw_screen = game.reset()
-    current_screen = process_screen(raw_screen)
-    # Create initial stack of 4 frames (all same at start)
-    state = torch.cat([current_screen] * 4, dim=0).unsqueeze(0) # Shape (1, 4, 84, 84)
-    
-    total_reward = 0
-    
-    while True:
-        # A. SELECT ACTION (Epsilon Greedy)
-        eps_threshold = EPS_END + (EPS_START - EPS_END) * \
-                        np.exp(-1. * steps_done / EPS_DECAY)
-        steps_done += 1
-        
-        if random.random() > eps_threshold:
-            with torch.no_grad():
-                # Ask the brain (Exploit)
-                action = policy_net(state).max(1)[1].view(1, 1)
-        else:
-            # Random move (Explore)
-            action = torch.tensor([[random.randrange(n_actions)]], device=device, dtype=torch.long)
+    try:
+        for episode in range(start_episode, args.episodes):
+            obs, info = env.reset()
+            episode_reward = 0.0
+            episode_loss = 0.0
+            loss_count = 0
+            episode_steps = 0
+            t_start = time.time()
 
-        # B. EXECUTE ACTION
-        raw_screen, reward, done = game.step(action.item())
-        total_reward += reward
-        
-        # Process new state
-        screen_tensor = process_screen(raw_screen)
-        # Shift stack: Remove oldest frame, add newest
-        next_state = torch.cat((state[0, 1:], screen_tensor), dim=0).unsqueeze(0)
+            while True:
+                # Select action
+                action, q_values = agent.select_action(obs)
 
-        # C. STORE MEMORY
-        reward_tensor = torch.tensor([reward], device=device)
-        memory.append((state, action, next_state, reward_tensor, done))
-        state = next_state
+                # Step environment
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
 
-        # D. OPTIMIZE (Train the Brain)
-        if len(memory) > BATCH_SIZE:
-            transitions = random.sample(memory, BATCH_SIZE)
-            # Unzip the batch data
-            batch_state, batch_action, batch_next, batch_reward, batch_done = zip(*transitions)
-            
-            batch_state = torch.cat(batch_state)
-            batch_action = torch.cat(batch_action)
-            batch_reward = torch.cat(batch_reward)
-            batch_next = torch.cat(batch_next)
-            
-            # 1. Current Q-Values (Student Guess)
-            current_q_values = policy_net(batch_state).gather(1, batch_action)
-            
-            # 2. Target Q-Values (Teacher Truth)
-            # "What is the best future move?"
-            next_q_values = target_net(batch_next).max(1)[0].detach()
-            
-            # Bellman Equation
-            # If done, target = reward. If not, target = reward + gamma * future
-            # We use a mask (1 - batch_done) to handle game over logic
-            mask = torch.tensor([0 if d else 1 for d in batch_done], device=device)
-            expected_q_values = batch_reward + (next_q_values * GAMMA * mask)
+                # Store & learn
+                agent.store_transition(obs, action, next_obs, reward, done)
+                loss = agent.optimize()
+                if loss is not None:
+                    episode_loss += loss
+                    loss_count += 1
 
-            # 3. Compute Loss & Backprop
-            loss = nn.functional.smooth_l1_loss(current_q_values, expected_q_values.unsqueeze(1))
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                obs = next_obs
+                episode_reward += reward
+                episode_steps += 1
+                total_steps += 1
 
-        # Update Target Network occasionally
-        if steps_done % TARGET_UPDATE == 0:
-            target_net.load_state_dict(policy_net.state_dict())
+                if done:
+                    break
 
-        if done:
-            break
-            
-    # ... inside the main loop ...
-        
-    print(f"Episode {i_episode} - Score: {total_reward} - Epsilon: {eps_threshold:.2f}")
+            # ---- Logging ----
+            epsilon = agent.get_epsilon()
+            avg_loss = episode_loss / max(loss_count, 1)
+            fps = episode_steps / max(time.time() - t_start, 1e-3)
 
-    # SAVE THE BRAIN every 50 episodes
-    if i_episode % 50 == 0:
-        torch.save(policy_net.state_dict(), f"dino_brain_{i_episode}.pth")
-        print(f"--- Saved Checkpoint: dino_brain_{i_episode}.pth ---")
+            recent_scores.append(info['score'])
+            if len(recent_scores) > 100:
+                recent_scores.pop(0)
+            avg_score = np.mean(recent_scores)
 
+            # Console output
+            print(f'Ep {episode:4d} | '
+                  f'Score: {info["score"]:3d} | '
+                  f'Avg100: {avg_score:6.1f} | '
+                  f'Reward: {episode_reward:8.1f} | '
+                  f'e: {epsilon:.3f} | '
+                  f'Loss: {avg_loss:.4f} | '
+                  f'Steps: {episode_steps:5d} | '
+                  f'FPS: {fps:.0f}')
+
+            # TensorBoard scalars
+            writer.add_scalar('Episode/Score', info['score'], episode)
+            writer.add_scalar('Episode/Reward', episode_reward, episode)
+            writer.add_scalar('Episode/AvgScore_100', avg_score, episode)
+            writer.add_scalar('Episode/Epsilon', epsilon, episode)
+            writer.add_scalar('Episode/AvgLoss', avg_loss, episode)
+            writer.add_scalar('Episode/Steps', episode_steps, episode)
+            writer.add_scalar('Episode/GameSpeed', info['speed'], episode)
+            writer.add_scalar('Training/FPS', fps, episode)
+            writer.add_scalar('Training/TotalSteps', total_steps, episode)
+            writer.add_scalar('Training/BufferSize', len(agent.memory), episode)
+
+            # ---- Checkpointing ----
+            # Periodic snapshot
+            if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
+                path = os.path.join(args.checkpoint_dir,
+                                    f'checkpoint_ep{episode}.pth')
+                agent.save_checkpoint(path, episode, best_score)
+                print(f'  Saved checkpoint: {path}')
+
+            # Best model
+            if episode_reward > best_score:
+                best_score = episode_reward
+                path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+                agent.save_checkpoint(path, episode, best_score)
+                print(f'  New best! Saved: {path}')
+
+            # Latest (always, for easy resume)
+            agent.save_checkpoint(
+                os.path.join(args.checkpoint_dir, 'latest.pth'),
+                episode, best_score)
+
+    except KeyboardInterrupt:
+        print(f'\n{"=" * 60}')
+        print(f'  Training interrupted at episode {episode}')
+        path = os.path.join(args.checkpoint_dir,
+                            f'interrupted_ep{episode}.pth')
+        agent.save_checkpoint(path, episode, best_score)
+        print(f'  Saved: {path}')
+        print('=' * 60)
+
+    finally:
+        writer.close()
+        env.close()
+        print(f'\n  Best score achieved: {best_score:.1f}')
+        print(f'  TensorBoard logs  : {args.log_dir}/{run_name}')
+        print(f'  To view: tensorboard --logdir {args.log_dir}')
+
+
+if __name__ == '__main__':
+    train(parse_args())
